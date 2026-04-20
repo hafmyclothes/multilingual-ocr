@@ -3,11 +3,24 @@ import re
 import csv
 import uuid
 import unicodedata
+import os
+import json
 from io import StringIO, BytesIO
 from pathlib import Path
 from collections import Counter
 import pythainlp
 from pythainlp.tokenize import word_tokenize
+
+# Load Google credentials from Streamlit secrets if available
+if "gcp_service_account" in st.secrets:
+    try:
+        gcp_credentials = dict(st.secrets["gcp_service_account"])
+        credentials_path = "gcp-credentials.json"
+        with open(credentials_path, "w") as f:
+            json.dump(gcp_credentials, f)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
+    except Exception as e:
+        st.sidebar.warning(f"Failed to load GCP secrets: {str(e)}")
 
 # Try to import optional dependencies
 try:
@@ -17,16 +30,22 @@ except ImportError:
     PYMUPDF_AVAILABLE = False
 
 try:
+    from google.cloud import vision
+    import google.auth
+    # Check if credentials are available
+    try:
+        credentials, project = google.auth.default()
+        GOOGLE_VISION_AVAILABLE = True
+    except:
+        GOOGLE_VISION_AVAILABLE = False
+except ImportError:
+    GOOGLE_VISION_AVAILABLE = False
+
+try:
     from PIL import Image
     PILLOW_AVAILABLE = True
 except ImportError:
     PILLOW_AVAILABLE = False
-
-try:
-    import easyocr
-    EASYOCR_AVAILABLE = True
-except ImportError:
-    EASYOCR_AVAILABLE = False
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 
@@ -108,69 +127,20 @@ def normalize_thai_text(text: str) -> str:
     return text.strip()
 
 
-def split_into_segments(text: str, min_length: int = 15) -> list:
-    """
-    Split normalized text into translation segments.
-    
-    Args:
-        text: Input text to split
-        min_length: Minimum segment length in characters
-    
-    Returns:
-        List of segments
-    """
-    # First split on double newlines (paragraph breaks)
-    paragraphs = text.split('\n\n')
-    
+def split_into_segments(text: str) -> list:
+    """Split normalized Thai text into translation segments."""
+    pattern = re.compile(
+        r'(?<=[ๆ\.\!\?\u0e2f\u0e5a\u0e5b])\s+'
+        r'|(?<=\n)'
+        r'|\n'
+    )
+    raw = pattern.split(text)
     segments = []
-    
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
-        
-        # Split on sentence boundaries (Thai sentence enders + newlines)
-        # But be more conservative to avoid over-splitting
-        parts = re.split(r'(?<=[\.!\?\u0e2f\u0e5a\u0e5b])\s+(?=[A-ZĀ-Ža-z\u0e00-\u0e7f])|(?<=\n)', para)
-        
-        current_segment = ""
-        
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            
-            # If adding this part would make segment too long, save current and start new
-            if current_segment and len(current_segment) > 200:
-                if len(current_segment) >= min_length:
-                    segments.append(current_segment.strip())
-                current_segment = part
-            else:
-                # Accumulate parts
-                if current_segment:
-                    current_segment += " " + part
-                else:
-                    current_segment = part
-        
-        # Don't forget the last segment
-        if current_segment and len(current_segment) >= min_length:
-            segments.append(current_segment.strip())
-    
-    # Merge very short segments with previous ones
-    merged_segments = []
-    i = 0
-    while i < len(segments):
-        seg = segments[i]
-        
-        # If segment is too short and there's a previous segment, merge
-        if len(seg) < min_length and merged_segments:
-            merged_segments[-1] = merged_segments[-1] + " " + seg
-        else:
-            merged_segments.append(seg)
-        
-        i += 1
-    
-    return merged_segments
+    for seg in raw:
+        seg = seg.strip()
+        if seg and len(seg) > 1:
+            segments.append(seg)
+    return segments
 
 
 def extract_glossary(segments: list, top_n: int = 50, min_len: int = 2, min_freq: int = 2) -> dict:
@@ -239,53 +209,51 @@ def extract_from_pdf(file_bytes: bytes) -> str:
     return "\n\n".join(full_text_parts)
 
 
-@st.cache_resource
-def load_ocr_reader():
-    """Load EasyOCR reader (cached for performance)."""
-    try:
-        return easyocr.Reader(['th', 'en'])
-    except Exception as e:
-        st.error(f"Failed to load OCR: {str(e)}")
-        return None
+def extract_from_image_google_vision(file_bytes: bytes) -> str:
+    """Extract text from image using Google Cloud Vision API."""
+    if not GOOGLE_VISION_AVAILABLE:
+        raise RuntimeError("Google Cloud Vision API not configured. See setup instructions.")
+    
+    client = vision.ImageAnnotatorClient()
+    image = vision.Image(content=file_bytes)
+    
+    # Use document_text_detection for better accuracy
+    response = client.document_text_detection(image=image)
+    
+    if response.error.message:
+        raise Exception(f"Google Vision API error: {response.error.message}")
+    
+    if response.text_annotations:
+        # First annotation contains all text
+        return response.text_annotations[0].description
+    
+    return ""
 
 
 def extract_from_image(file_bytes: bytes) -> str:
-    """Extract text from image using EasyOCR."""
+    """Extract text from image file."""
     if not PILLOW_AVAILABLE:
-        st.error("Pillow not installed")
-        return ""
+        raise RuntimeError("Pillow not installed")
     
-    if not EASYOCR_AVAILABLE:
-        st.error("""
-        ❌ EasyOCR not installed
-        
-        Install: `pip install easyocr`
-        """)
-        return ""
-    
-    try:
-        # Load image
-        img = Image.open(BytesIO(file_bytes))
-        
-        # Convert to numpy array
-        import numpy as np
-        img_array = np.array(img)
-        
-        # Load reader
-        reader = load_ocr_reader()
-        if reader is None:
+    # Try Google Cloud Vision first
+    if GOOGLE_VISION_AVAILABLE:
+        try:
+            return extract_from_image_google_vision(file_bytes)
+        except Exception as e:
+            st.warning(f"⚠️ Google Vision API failed: {str(e)}")
+            st.info("💡 Set up Google Cloud Vision API for image OCR. See CLOUD_SETUP.md")
             return ""
+    else:
+        st.error("""
+        ❌ Image OCR requires Google Cloud Vision API
         
-        # Extract text
-        st.info("🔄 กำลังประมวลผล OCR... (ครั้งแรกจะใช้เวลาสักครู่)")
-        results = reader.readtext(img_array, detail=0)
+        **Setup:**
+        1. See CLOUD_SETUP.md in repository
+        2. Set GOOGLE_APPLICATION_CREDENTIALS environment variable
+        3. Restart the app
         
-        # Combine results
-        text = "\n".join(results)
-        return text
-    
-    except Exception as e:
-        st.error(f"❌ OCR failed: {str(e)}")
+        **Alternative:** Convert image to PDF first
+        """)
         return ""
 
 
@@ -322,68 +290,65 @@ def glossary_to_csv(glossary_dict: dict) -> str:
 st.markdown("""
 # 📄 ไทยอักษร · Thai Text Extractor
 
-สกัดข้อความ **ไทย + อังกฤษ** จาก PDF พร้อมสร้าง Glossary สำหรับนักแปล
+สกัดข้อความ **ไทย + อังกฤษ** จาก PDF/รูปภาพ พร้อมสร้าง Glossary สำหรับนักแปล
 """)
 
-st.info("✨ สกัดข้อความและสร้าง Glossary สำหรับ CAT Tools | สนับสนุนไทย + อังกฤษ")
+st.info("✨ รองรับ PDF และรูปภาพ (PNG/JPG) | แยกคำศัพท์ภาษาไทยและอังกฤษ")
 
 # Sidebar
 with st.sidebar:
     st.markdown("### ⚙️ ตั้งค่า")
-    
-    st.markdown("**📏 การแบ่ง Segments**")
-    min_segment_length = st.slider(
-        "ความยาวต่ำสุด (ตัวอักษร)", 
-        5, 50, 15,
-        help="Segments ที่สั้นกว่านี้จะถูกรวมเข้ากับ segment ก่อนหน้า"
-    )
-    
-    st.markdown("**📚 Glossary**")
     top_n_glossary = st.slider("จำนวนคำในคลังศัพท์", 10, 100, 50)
     min_frequency = st.slider("ความถี่ต่ำสุด", 1, 10, 2)
     
     st.markdown("---")
     st.markdown("### 📊 สถานะ")
     
-    if PYMUPDF_AVAILABLE:
-        st.success("✅ PyMuPDF (PDF extraction)")
-    else:
-        st.error("❌ PyMuPDF (PDF extraction)")
+    status_items = {
+        "PyMuPDF (PDF)": PYMUPDF_AVAILABLE,
+        "Pillow (Images)": PILLOW_AVAILABLE,
+        "Google Vision (OCR)": GOOGLE_VISION_AVAILABLE,
+    }
     
-    if EASYOCR_AVAILABLE:
-        st.success("✅ EasyOCR (Image OCR - ไทย + อังกฤษ)")
-    else:
-        st.warning("⚠️ EasyOCR (ติดตั้ง: pip install easyocr)")
+    for name, available in status_items.items():
+        if available:
+            st.success(f"✅ {name}")
+        else:
+            st.error(f"❌ {name}")
+    
+    if not GOOGLE_VISION_AVAILABLE:
+        with st.expander("ℹ️ ตั้งค่า Google Vision"):
+            st.markdown("""
+            **สำหรับ OCR รูปภาพ:**
+            1. ดู `CLOUD_SETUP.md`
+            2. ตั้งค่า `GOOGLE_APPLICATION_CREDENTIALS`
+            3. Restart app
+            """)
 
 # Main interface
 col1, col2 = st.columns([1, 1])
 
 with col1:
     st.markdown("### 📁 อัปโหลดไฟล์")
-    
-    if EASYOCR_AVAILABLE:
-        st.markdown("> รองรับ: **PDF, PNG, JPG, JPEG, WEBP**")
-        supported_types = ["pdf", "png", "jpg", "jpeg", "webp"]
-    else:
-        st.markdown("> รองรับ: **PDF** (text-based)")
-        st.info("💡 ต้องการ PNG/JPG? ติดตั้ง: `pip install easyocr`")
-        supported_types = ["pdf"]
+    st.markdown("> รองรับ: **PDF, PNG, JPG, JPEG, WEBP**")
     
     uploaded_file = st.file_uploader(
         "เลือกไฟล์", 
-        type=supported_types,
-        help="PDF (text-based) หรือรูปภาพ (ใช้ EasyOCR)"
+        type=["pdf", "png", "jpg", "jpeg", "webp"],
+        help="PDF (text-based) หรือรูปภาพ (ต้องตั้งค่า Google Cloud Vision API)"
     )
 
 with col2:
     st.markdown("### ℹ️ วิธีใช้")
     st.markdown("""
-    1. อัปโหลด **PDF**
+    1. อัปโหลด **PDF** หรือ **รูปภาพ** (PNG/JPG)
     2. ระบบจะสกัดข้อความและแบ่งเป็น segments
-    3. สกัดคำไทย + อังกฤษที่พบซ้ำบ่อย
+    3. สกัดคำไทย + อังกฤษที่พบซ้ำบ่อยเป็น glossary
     4. ดาวน์โหลด CSV ไปใน CAT Tools
     
-    **หมายเหตุ:** PDF ต้องเป็น text-based (มีข้อความ ไม่ใช่รูปภาพ)
+    **หมายเหตุ:** 
+    - 🖼️ OCR รูปภาพต้องตั้งค่า Google Cloud Vision API
+    - 📄 PDF ต้องเป็น text-based (ไม่ใช่ scanned)
     """)
 
 # Processing
@@ -404,7 +369,7 @@ if uploaded_file is not None:
             st.info("📖 สกัดข้อความจาก PDF...")
             raw_text = extract_from_pdf(file_bytes)
         elif file_ext in ['.png', '.jpg', '.jpeg', '.webp']:
-            st.info("🖼️ ใช้ EasyOCR สกัดข้อความจากรูปภาพ...")
+            st.info("🖼️ ใช้ OCR สกัดข้อความจากรูปภาพ...")
             raw_text = extract_from_image(file_bytes)
         else:
             st.error(f"❌ ไม่รองรับไฟล์นามสกุล {file_ext}")
@@ -413,8 +378,11 @@ if uploaded_file is not None:
         progress_bar.progress(20)
         
         if not raw_text.strip():
-            st.error("❌ ไม่พบข้อความในไฟล์ PDF")
-            st.info("💡 ตรวจสอบว่า PDF เป็น text-based (มีข้อความ) ไม่ใช่ scanned")
+            st.error("❌ ไม่พบข้อความในไฟล์")
+            if file_ext == '.pdf':
+                st.info("💡 PDF ต้องเป็น text-based (ไม่ใช่ scanned)")
+            else:
+                st.info("💡 ตรวจสอบว่าตั้งค่า Google Cloud Vision API แล้วหรือยัง")
             st.stop()
         
         # Normalize
@@ -424,7 +392,7 @@ if uploaded_file is not None:
         
         # Split segments
         st.info("✂️ แบ่งประโยค...")
-        segments = split_into_segments(normalized, min_length=min_segment_length)
+        segments = split_into_segments(normalized)
         progress_bar.progress(60)
         
         if not segments:
@@ -550,13 +518,13 @@ if uploaded_file is not None:
     
     except Exception as e:
         st.error(f"❌ เกิดข้อผิดพลาด: {str(e)}")
-        st.info("💡 ตรวจสอบว่า PDF เป็น text-based และมีข้อความ")
+        st.info("💡 แนวทาง: ตรวจสอบว่า PDF เป็น text-based (ไม่ใช่ scanned)")
 
 # Footer
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #7a6e60; font-size: 12px;">
-    <p>ไทยอักษร · Thai Text Extractor v2.1</p>
+    <p>ไทยอักษร · Thai Text Extractor v1.0</p>
     <p>Powered by PyThaiNLP · PyMuPDF · Streamlit</p>
     <p><a href="https://github.com/hafmyclothes/thai-text-extractor">GitHub Repository</a></p>
 </div>
