@@ -3,8 +3,6 @@ import re
 import csv
 import uuid
 import unicodedata
-import os
-import json
 from io import StringIO, BytesIO
 from pathlib import Path
 from collections import Counter
@@ -24,20 +22,11 @@ try:
 except ImportError:
     PILLOW_AVAILABLE = False
 
-# Google Cloud Vision - optional, requires proper setup
-GOOGLE_VISION_AVAILABLE = False
 try:
-    # Only try to import and use Google Vision if credentials are available
-    from google.cloud import vision
-    import google.auth
-    
-    try:
-        credentials, project = google.auth.default()
-        GOOGLE_VISION_AVAILABLE = True
-    except:
-        pass
+    import easyocr
+    EASYOCR_AVAILABLE = True
 except ImportError:
-    pass
+    EASYOCR_AVAILABLE = False
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 
@@ -201,39 +190,53 @@ def extract_from_pdf(file_bytes: bytes) -> str:
     return "\n\n".join(full_text_parts)
 
 
+@st.cache_resource
+def load_ocr_reader():
+    """Load EasyOCR reader (cached for performance)."""
+    try:
+        return easyocr.Reader(['th', 'en'])
+    except Exception as e:
+        st.error(f"Failed to load OCR: {str(e)}")
+        return None
+
+
 def extract_from_image(file_bytes: bytes) -> str:
-    """Extract text from image file."""
+    """Extract text from image using EasyOCR."""
     if not PILLOW_AVAILABLE:
-        raise RuntimeError("Pillow not installed")
+        st.error("Pillow not installed")
+        return ""
     
-    if not GOOGLE_VISION_AVAILABLE:
+    if not EASYOCR_AVAILABLE:
         st.error("""
-        ❌ Image OCR requires Google Cloud Vision API
+        ❌ EasyOCR not installed
         
-        **วิธีตั้งค่า:**
-        1. ดู `CLOUD_SETUP.md` ในโปรเจกต์
-        2. สำหรับ Streamlit Cloud ดู `STREAMLIT_SECRETS.md`
-        3. Restart app
-        
-        **ชั่วคราว:** ลองใช้ PDF แทนภาพ
+        Install: `pip install easyocr`
         """)
         return ""
     
     try:
-        client = vision.ImageAnnotatorClient()
-        image = vision.Image(content=file_bytes)
-        response = client.document_text_detection(image=image)
+        # Load image
+        img = Image.open(BytesIO(file_bytes))
         
-        if response.error.message:
-            raise Exception(f"Google Vision error: {response.error.message}")
+        # Convert to numpy array
+        import numpy as np
+        img_array = np.array(img)
         
-        if response.text_annotations:
-            return response.text_annotations[0].description
+        # Load reader
+        reader = load_ocr_reader()
+        if reader is None:
+            return ""
         
-        return ""
+        # Extract text
+        st.info("🔄 กำลังประมวลผล OCR... (ครั้งแรกจะใช้เวลาสักครู่)")
+        results = reader.readtext(img_array, detail=0)
+        
+        # Combine results
+        text = "\n".join(results)
+        return text
+    
     except Exception as e:
         st.error(f"❌ OCR failed: {str(e)}")
-        st.info("💡 ตรวจสอบว่า Google Cloud Vision API ตั้งค่าถูกต้องแล้ว")
         return ""
 
 
@@ -270,10 +273,10 @@ def glossary_to_csv(glossary_dict: dict) -> str:
 st.markdown("""
 # 📄 ไทยอักษร · Thai Text Extractor
 
-สกัดข้อความ **ไทย + อังกฤษ** จาก PDF/รูปภาพ พร้อมสร้าง Glossary สำหรับนักแปล
+สกัดข้อความ **ไทย + อังกฤษ** จาก PDF พร้อมสร้าง Glossary สำหรับนักแปล
 """)
 
-st.info("✨ รองรับ PDF และรูปภาพ (PNG/JPG) | แยกคำศัพท์ภาษาไทยและอังกฤษ")
+st.info("✨ สกัดข้อความและสร้าง Glossary สำหรับ CAT Tools | สนับสนุนไทย + อังกฤษ")
 
 # Sidebar
 with st.sidebar:
@@ -284,26 +287,15 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 📊 สถานะ")
     
-    status_items = {
-        "PyMuPDF (PDF)": PYMUPDF_AVAILABLE,
-        "Pillow (Images)": PILLOW_AVAILABLE,
-        "Google Vision (OCR)": GOOGLE_VISION_AVAILABLE,
-    }
+    if PYMUPDF_AVAILABLE:
+        st.success("✅ PyMuPDF (PDF extraction)")
+    else:
+        st.error("❌ PyMuPDF (PDF extraction)")
     
-    for name, available in status_items.items():
-        if available:
-            st.success(f"✅ {name}")
-        else:
-            st.error(f"❌ {name}")
-    
-    if not GOOGLE_VISION_AVAILABLE:
-        with st.expander("ℹ️ ตั้งค่า Google Vision"):
-            st.markdown("""
-            **สำหรับ OCR รูปภาพ:**
-            1. ดู `CLOUD_SETUP.md`
-            2. ตั้งค่า `GOOGLE_APPLICATION_CREDENTIALS`
-            3. Restart app
-            """)
+    if EASYOCR_AVAILABLE:
+        st.success("✅ EasyOCR (Image OCR - ไทย + อังกฤษ)")
+    else:
+        st.warning("⚠️ EasyOCR (ติดตั้ง: pip install easyocr)")
 
 # Main interface
 col1, col2 = st.columns([1, 1])
@@ -311,31 +303,29 @@ col1, col2 = st.columns([1, 1])
 with col1:
     st.markdown("### 📁 อัปโหลดไฟล์")
     
-    if GOOGLE_VISION_AVAILABLE:
+    if EASYOCR_AVAILABLE:
         st.markdown("> รองรับ: **PDF, PNG, JPG, JPEG, WEBP**")
         supported_types = ["pdf", "png", "jpg", "jpeg", "webp"]
     else:
         st.markdown("> รองรับ: **PDF** (text-based)")
-        st.info("💡 ต้องการสนับสนุน PNG/JPG? ดู CLOUD_SETUP.md")
+        st.info("💡 ต้องการ PNG/JPG? ติดตั้ง: `pip install easyocr`")
         supported_types = ["pdf"]
     
     uploaded_file = st.file_uploader(
         "เลือกไฟล์", 
         type=supported_types,
-        help="PDF (text-based) หรือรูปภาพ (ต้องตั้งค่า Google Cloud Vision API)"
+        help="PDF (text-based) หรือรูปภาพ (ใช้ EasyOCR)"
     )
 
 with col2:
     st.markdown("### ℹ️ วิธีใช้")
     st.markdown("""
-    1. อัปโหลด **PDF** หรือ **รูปภาพ** (PNG/JPG)
+    1. อัปโหลด **PDF**
     2. ระบบจะสกัดข้อความและแบ่งเป็น segments
-    3. สกัดคำไทย + อังกฤษที่พบซ้ำบ่อยเป็น glossary
+    3. สกัดคำไทย + อังกฤษที่พบซ้ำบ่อย
     4. ดาวน์โหลด CSV ไปใน CAT Tools
     
-    **หมายเหตุ:** 
-    - 🖼️ OCR รูปภาพต้องตั้งค่า Google Cloud Vision API
-    - 📄 PDF ต้องเป็น text-based (ไม่ใช่ scanned)
+    **หมายเหตุ:** PDF ต้องเป็น text-based (มีข้อความ ไม่ใช่รูปภาพ)
     """)
 
 # Processing
@@ -356,7 +346,7 @@ if uploaded_file is not None:
             st.info("📖 สกัดข้อความจาก PDF...")
             raw_text = extract_from_pdf(file_bytes)
         elif file_ext in ['.png', '.jpg', '.jpeg', '.webp']:
-            st.info("🖼️ ใช้ OCR สกัดข้อความจากรูปภาพ...")
+            st.info("🖼️ ใช้ EasyOCR สกัดข้อความจากรูปภาพ...")
             raw_text = extract_from_image(file_bytes)
         else:
             st.error(f"❌ ไม่รองรับไฟล์นามสกุล {file_ext}")
@@ -365,11 +355,8 @@ if uploaded_file is not None:
         progress_bar.progress(20)
         
         if not raw_text.strip():
-            st.error("❌ ไม่พบข้อความในไฟล์")
-            if file_ext == '.pdf':
-                st.info("💡 PDF ต้องเป็น text-based (ไม่ใช่ scanned)")
-            else:
-                st.info("💡 ตรวจสอบว่าตั้งค่า Google Cloud Vision API แล้วหรือยัง")
+            st.error("❌ ไม่พบข้อความในไฟล์ PDF")
+            st.info("💡 ตรวจสอบว่า PDF เป็น text-based (มีข้อความ) ไม่ใช่ scanned")
             st.stop()
         
         # Normalize
@@ -505,13 +492,13 @@ if uploaded_file is not None:
     
     except Exception as e:
         st.error(f"❌ เกิดข้อผิดพลาด: {str(e)}")
-        st.info("💡 แนวทาง: ตรวจสอบว่า PDF เป็น text-based (ไม่ใช่ scanned)")
+        st.info("💡 ตรวจสอบว่า PDF เป็น text-based และมีข้อความ")
 
 # Footer
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #7a6e60; font-size: 12px;">
-    <p>ไทยอักษร · Thai Text Extractor v1.0</p>
+    <p>ไทยอักษร · Thai Text Extractor v2.1</p>
     <p>Powered by PyThaiNLP · PyMuPDF · Streamlit</p>
     <p><a href="https://github.com/hafmyclothes/thai-text-extractor">GitHub Repository</a></p>
 </div>
