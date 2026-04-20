@@ -108,20 +108,69 @@ def normalize_thai_text(text: str) -> str:
     return text.strip()
 
 
-def split_into_segments(text: str) -> list:
-    """Split normalized Thai text into translation segments."""
-    pattern = re.compile(
-        r'(?<=[ๆ\.\!\?\u0e2f\u0e5a\u0e5b])\s+'
-        r'|(?<=\n)'
-        r'|\n'
-    )
-    raw = pattern.split(text)
+def split_into_segments(text: str, min_length: int = 15) -> list:
+    """
+    Split normalized text into translation segments.
+    
+    Args:
+        text: Input text to split
+        min_length: Minimum segment length in characters
+    
+    Returns:
+        List of segments
+    """
+    # First split on double newlines (paragraph breaks)
+    paragraphs = text.split('\n\n')
+    
     segments = []
-    for seg in raw:
-        seg = seg.strip()
-        if seg and len(seg) > 1:
-            segments.append(seg)
-    return segments
+    
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        
+        # Split on sentence boundaries (Thai sentence enders + newlines)
+        # But be more conservative to avoid over-splitting
+        parts = re.split(r'(?<=[\.!\?\u0e2f\u0e5a\u0e5b])\s+(?=[A-ZĀ-Ža-z\u0e00-\u0e7f])|(?<=\n)', para)
+        
+        current_segment = ""
+        
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            
+            # If adding this part would make segment too long, save current and start new
+            if current_segment and len(current_segment) > 200:
+                if len(current_segment) >= min_length:
+                    segments.append(current_segment.strip())
+                current_segment = part
+            else:
+                # Accumulate parts
+                if current_segment:
+                    current_segment += " " + part
+                else:
+                    current_segment = part
+        
+        # Don't forget the last segment
+        if current_segment and len(current_segment) >= min_length:
+            segments.append(current_segment.strip())
+    
+    # Merge very short segments with previous ones
+    merged_segments = []
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        
+        # If segment is too short and there's a previous segment, merge
+        if len(seg) < min_length and merged_segments:
+            merged_segments[-1] = merged_segments[-1] + " " + seg
+        else:
+            merged_segments.append(seg)
+        
+        i += 1
+    
+    return merged_segments
 
 
 def extract_glossary(segments: list, top_n: int = 50, min_len: int = 2, min_freq: int = 2) -> dict:
@@ -281,6 +330,15 @@ st.info("✨ สกัดข้อความและสร้าง Glossary 
 # Sidebar
 with st.sidebar:
     st.markdown("### ⚙️ ตั้งค่า")
+    
+    st.markdown("**📏 การแบ่ง Segments**")
+    min_segment_length = st.slider(
+        "ความยาวต่ำสุด (ตัวอักษร)", 
+        5, 50, 15,
+        help="Segments ที่สั้นกว่านี้จะถูกรวมเข้ากับ segment ก่อนหน้า"
+    )
+    
+    st.markdown("**📚 Glossary**")
     top_n_glossary = st.slider("จำนวนคำในคลังศัพท์", 10, 100, 50)
     min_frequency = st.slider("ความถี่ต่ำสุด", 1, 10, 2)
     
@@ -366,7 +424,7 @@ if uploaded_file is not None:
         
         # Split segments
         st.info("✂️ แบ่งประโยค...")
-        segments = split_into_segments(normalized)
+        segments = split_into_segments(normalized, min_length=min_segment_length)
         progress_bar.progress(60)
         
         if not segments:
