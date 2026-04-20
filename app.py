@@ -11,17 +11,6 @@ from collections import Counter
 import pythainlp
 from pythainlp.tokenize import word_tokenize
 
-# Load Google credentials from Streamlit secrets if available
-if "gcp_service_account" in st.secrets:
-    try:
-        gcp_credentials = dict(st.secrets["gcp_service_account"])
-        credentials_path = "gcp-credentials.json"
-        with open(credentials_path, "w") as f:
-            json.dump(gcp_credentials, f)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
-    except Exception as e:
-        st.sidebar.warning(f"Failed to load GCP secrets: {str(e)}")
-
 # Try to import optional dependencies
 try:
     import fitz  # PyMuPDF
@@ -30,22 +19,25 @@ except ImportError:
     PYMUPDF_AVAILABLE = False
 
 try:
-    from google.cloud import vision
-    import google.auth
-    # Check if credentials are available
-    try:
-        credentials, project = google.auth.default()
-        GOOGLE_VISION_AVAILABLE = True
-    except:
-        GOOGLE_VISION_AVAILABLE = False
-except ImportError:
-    GOOGLE_VISION_AVAILABLE = False
-
-try:
     from PIL import Image
     PILLOW_AVAILABLE = True
 except ImportError:
     PILLOW_AVAILABLE = False
+
+# Google Cloud Vision - optional, requires proper setup
+GOOGLE_VISION_AVAILABLE = False
+try:
+    # Only try to import and use Google Vision if credentials are available
+    from google.cloud import vision
+    import google.auth
+    
+    try:
+        credentials, project = google.auth.default()
+        GOOGLE_VISION_AVAILABLE = True
+    except:
+        pass
+except ImportError:
+    pass
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 
@@ -209,51 +201,39 @@ def extract_from_pdf(file_bytes: bytes) -> str:
     return "\n\n".join(full_text_parts)
 
 
-def extract_from_image_google_vision(file_bytes: bytes) -> str:
-    """Extract text from image using Google Cloud Vision API."""
-    if not GOOGLE_VISION_AVAILABLE:
-        raise RuntimeError("Google Cloud Vision API not configured. See setup instructions.")
-    
-    client = vision.ImageAnnotatorClient()
-    image = vision.Image(content=file_bytes)
-    
-    # Use document_text_detection for better accuracy
-    response = client.document_text_detection(image=image)
-    
-    if response.error.message:
-        raise Exception(f"Google Vision API error: {response.error.message}")
-    
-    if response.text_annotations:
-        # First annotation contains all text
-        return response.text_annotations[0].description
-    
-    return ""
-
-
 def extract_from_image(file_bytes: bytes) -> str:
     """Extract text from image file."""
     if not PILLOW_AVAILABLE:
         raise RuntimeError("Pillow not installed")
     
-    # Try Google Cloud Vision first
-    if GOOGLE_VISION_AVAILABLE:
-        try:
-            return extract_from_image_google_vision(file_bytes)
-        except Exception as e:
-            st.warning(f"⚠️ Google Vision API failed: {str(e)}")
-            st.info("💡 Set up Google Cloud Vision API for image OCR. See CLOUD_SETUP.md")
-            return ""
-    else:
+    if not GOOGLE_VISION_AVAILABLE:
         st.error("""
         ❌ Image OCR requires Google Cloud Vision API
         
-        **Setup:**
-        1. See CLOUD_SETUP.md in repository
-        2. Set GOOGLE_APPLICATION_CREDENTIALS environment variable
-        3. Restart the app
+        **วิธีตั้งค่า:**
+        1. ดู `CLOUD_SETUP.md` ในโปรเจกต์
+        2. สำหรับ Streamlit Cloud ดู `STREAMLIT_SECRETS.md`
+        3. Restart app
         
-        **Alternative:** Convert image to PDF first
+        **ชั่วคราว:** ลองใช้ PDF แทนภาพ
         """)
+        return ""
+    
+    try:
+        client = vision.ImageAnnotatorClient()
+        image = vision.Image(content=file_bytes)
+        response = client.document_text_detection(image=image)
+        
+        if response.error.message:
+            raise Exception(f"Google Vision error: {response.error.message}")
+        
+        if response.text_annotations:
+            return response.text_annotations[0].description
+        
+        return ""
+    except Exception as e:
+        st.error(f"❌ OCR failed: {str(e)}")
+        st.info("💡 ตรวจสอบว่า Google Cloud Vision API ตั้งค่าถูกต้องแล้ว")
         return ""
 
 
@@ -330,11 +310,18 @@ col1, col2 = st.columns([1, 1])
 
 with col1:
     st.markdown("### 📁 อัปโหลดไฟล์")
-    st.markdown("> รองรับ: **PDF, PNG, JPG, JPEG, WEBP**")
+    
+    if GOOGLE_VISION_AVAILABLE:
+        st.markdown("> รองรับ: **PDF, PNG, JPG, JPEG, WEBP**")
+        supported_types = ["pdf", "png", "jpg", "jpeg", "webp"]
+    else:
+        st.markdown("> รองรับ: **PDF** (text-based)")
+        st.info("💡 ต้องการสนับสนุน PNG/JPG? ดู CLOUD_SETUP.md")
+        supported_types = ["pdf"]
     
     uploaded_file = st.file_uploader(
         "เลือกไฟล์", 
-        type=["pdf", "png", "jpg", "jpeg", "webp"],
+        type=supported_types,
         help="PDF (text-based) หรือรูปภาพ (ต้องตั้งค่า Google Cloud Vision API)"
     )
 
